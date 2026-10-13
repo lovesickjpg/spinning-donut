@@ -1,84 +1,157 @@
-import math
+"""
+Spinning ASCII donut in the terminal.
+
+The math is from Andy Sloane's donut.c:
+https://www.a1k0n.net/2011/07/20/donut-math.html
+
+The difference is that here the whole frame is computed with numpy at once,
+including the z-buffer, so there's no python loop over points.
+"""
+
+import argparse
+import os
+import shutil
 import sys
 import time
+
 import numpy as np
 
-screen_width = 80
-screen_height = 30
-theta_spacing = 0.07
-phi_spacing = 0.02
-r1 = 1
-r2 = 2
-k2 = 5
-k1 = screen_width * k2 * 3 / (8 * (r1 + r2))
+# darkest -> brightest
+SHADES = np.array(list(".,-~:;=!*#$@"))
 
-output = np.full((screen_height, screen_width), ' ', dtype='<U1')
-zbuffer = np.zeros((screen_height, screen_width), dtype=np.float32)
+R1 = 1.0  # radius of the tube
+R2 = 2.0  # distance from the center of the donut to the center of the tube
+K2 = 5.0  # distance from the viewer to the donut
 
-def render(a, b):
-    output.fill(' ')
-    zbuffer.fill(0)
-    
-    theta = np.arange(0, 2 * np.pi, theta_spacing)
-    phi = np.arange(0, 2 * np.pi, phi_spacing)
-    theta_grid, phi_grid = np.meshgrid(theta, phi, indexing='ij')
-    
-    costheta, sintheta = np.cos(theta_grid), np.sin(theta_grid)
-    cosphi, sinphi = np.cos(phi_grid), np.sin(phi_grid)
-    cosa, sina = np.cos(a), np.sin(a)
-    cosb, sinb = np.cos(b), np.sin(b)
-    
-    circlex = r2 + r1 * costheta
-    circley = r1 * sintheta
-    
-    x = circlex * (cosb * cosphi + sina * sinb * sinphi) - circley * cosa * sinb
-    y = circlex * (sinb * cosphi - sina * cosb * sinphi) + circley * cosa * cosb
-    z = k2 + cosa * circlex * sinphi + circley * sina
-    ooz = 1 / z
-    
-    xp = (screen_width / 2 + k1 * ooz * x).astype(np.int32)
-    yp = (screen_height / 2 - k1 * ooz * y).astype(np.int32)
-    
-    l = (cosphi * costheta * cosb - cosa * sintheta * sinb - 
-         cosphi * costheta * sinb - cosa * sintheta * cosb - 
-         sina * sintheta)
-    
-    xpflat = xp.ravel()
-    ypflat = yp.ravel()
-    oozflat = ooz.ravel()
-    lflat = l.ravel()
-    
-    mask = ((xpflat >= 0) & (xpflat < screen_width) & 
-            (ypflat >= 0) & (ypflat < screen_height))
-    
-    for i in np.where(mask)[0]:
-        xi, yi = int(xpflat[i]), int(ypflat[i])
-        depth = float(oozflat[i])
-        lum = float(lflat[i])
-        
-        if depth > zbuffer[yi, xi]:
-            zbuffer[yi, xi] = depth
-            lumindex = int(lum * 8)
-            lumindex = max(0, min(lumindex, 11))
-            output[yi, xi] = '.,-~:;=!*#$@'[lumindex]
+# a terminal cell is roughly twice as tall as it is wide,
+# without this the donut looks squished
+CHAR_ASPECT = 2.0
 
-def show():
-    sys.stdout.write("\x1b[H")
-    sys.stdout.write('\n'.join(''.join(row) for row in output))
-    sys.stdout.flush()
+HIDE_CURSOR = "\x1b[?25l"
+SHOW_CURSOR = "\x1b[?25h"
+CLEAR = "\x1b[2J"
+HOME = "\x1b[H"
 
-sys.stdout.write("\x1b[2J\x1b[?25l")
 
-a = 0
-b = 0
+class Torus:
+    """Points on the surface of a torus. They don't depend on rotation,
+    so they're computed once and reused for every frame."""
 
-try:
-    while True:
-        render(a, b)
-        show()
-        a += 0.04
-        b += 0.02
-        time.sleep(0.03)
-except KeyboardInterrupt:
-    sys.stdout.write("\x1b[?25h")
-    print("\n")
+    def __init__(self, theta_step=0.07, phi_step=0.02):
+        # theta goes around the tube, phi goes around the center of the donut
+        theta, phi = np.meshgrid(
+            np.arange(0, 2 * np.pi, theta_step),
+            np.arange(0, 2 * np.pi, phi_step),
+            indexing="ij",
+        )
+        theta, phi = theta.ravel(), phi.ravel()
+
+        self.cos_t, self.sin_t = np.cos(theta), np.sin(theta)
+        self.cos_p, self.sin_p = np.cos(phi), np.sin(phi)
+
+        # the circle that gets swept around the y axis to make the donut
+        self.circle_x = R2 + R1 * self.cos_t
+        self.circle_y = R1 * self.sin_t
+
+
+def render_frame(torus, a, b, width, height):
+    """Returns the frame as a (height, width) array of characters.
+    a is the rotation around the x axis, b around the z axis."""
+    cos_a, sin_a = np.cos(a), np.sin(a)
+    cos_b, sin_b = np.cos(b), np.sin(b)
+
+    ct, st = torus.cos_t, torus.sin_t
+    cp, sp = torus.cos_p, torus.sin_p
+    cx, cy = torus.circle_x, torus.circle_y
+
+    # rotate around y (phi), then x (a), then z (b)
+    x = cx * (cos_b * cp + sin_a * sin_b * sp) - cy * cos_a * sin_b
+    y = cx * (sin_b * cp - sin_a * cos_b * sp) + cy * cos_a * cos_b
+    z = K2 + cos_a * cx * sp + cy * sin_a
+    ooz = 1 / z  # "one over z", the bigger it is the closer the point
+
+    # surface normal dotted with the light direction (0, 1, -1).
+    # goes from -sqrt(2) to sqrt(2)
+    lum = (cp * ct * sin_b - cos_a * ct * sp - sin_a * st
+           + cos_b * (cos_a * st - ct * sin_a * sp))
+
+    # the original used 3/8 of the screen width here, but with perspective
+    # the close side of the donut gets bigger and goes off screen when it tilts.
+    # worst case a point projects to (R1 + R2) / (K2 - R1), so scale by that
+    # and leave a bit of margin
+    max_extent = (R1 + R2) / (K2 - R1)
+    k1 = 0.45 * min(width / CHAR_ASPECT, height) / max_extent
+
+    col = np.floor(width / 2 + CHAR_ASPECT * k1 * ooz * x).astype(int)
+    row = np.floor(height / 2 - k1 * ooz * y).astype(int)
+
+    visible = (col >= 0) & (col < width) & (row >= 0) & (row < height)
+    col, row, ooz, lum = col[visible], row[visible], ooz[visible], lum[visible]
+
+    # z-buffer: for every cell remember the closest 1/z,
+    # then draw only the points that are the closest in their cell
+    cell = row * width + col
+    zbuf = np.zeros(width * height)
+    np.maximum.at(zbuf, cell, ooz)
+    front = ooz == zbuf[cell]
+
+    shade = np.clip((lum[front] * 8).astype(int), 0, len(SHADES) - 1)
+
+    frame = np.full(width * height, " ")
+    frame[cell[front]] = SHADES[shade]
+    return frame.reshape(height, width)
+
+
+def to_text(frame):
+    return "\n".join("".join(line) for line in frame)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="spinning ascii donut")
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--speed", type=float, default=1.0,
+                        help="rotation speed multiplier")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if os.name == "nt":
+        # turns on ansi escape codes in the old windows console.
+        # looks like nonsense but it actually works
+        os.system("")
+
+    torus = Torus()
+    frame_time = 1 / args.fps
+    a = b = 0.0
+    last_size = None
+
+    sys.stdout.write(HIDE_CURSOR + CLEAR)
+    try:
+        while True:
+            started = time.perf_counter()
+
+            size = shutil.get_terminal_size()
+            if size != last_size:
+                # leftovers from the old frame stay on screen after a resize
+                sys.stdout.write(CLEAR)
+                last_size = size
+
+            # one line less, otherwise the terminal scrolls on the last \n
+            frame = render_frame(torus, a, b, size.columns, size.lines - 1)
+            sys.stdout.write(HOME + to_text(frame))
+            sys.stdout.flush()
+
+            a += 0.04 * args.speed
+            b += 0.02 * args.speed
+
+            time.sleep(max(0.0, frame_time - (time.perf_counter() - started)))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write(SHOW_CURSOR + "\n")
+
+
+if __name__ == "__main__":
+    main()
